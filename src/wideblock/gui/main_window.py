@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..testing import algorithm_label, available_algorithms
+from ..testing import TestCategory, algorithm_label, available_algorithms
 from .pages import AlgorithmResultPage, ComparisonResultPage
 
 
@@ -95,14 +95,18 @@ class MainWindow(QMainWindow):
         self.single_button.clicked.connect(self._open_single_tab)
         side_layout.addWidget(self.single_button)
 
-        self.compare_button = QPushButton("打开交叉对比测试")
-        self.compare_button.clicked.connect(self._open_comparison_tab)
-        side_layout.addWidget(self.compare_button)
+        self.compare_perf_button = QPushButton("打开性能交叉对比")
+        self.compare_perf_button.clicked.connect(lambda: self._open_comparison_tab(TestCategory.PERFORMANCE))
+        side_layout.addWidget(self.compare_perf_button)
+
+        self.compare_security_button = QPushButton("打开安全性交叉对比")
+        self.compare_security_button.clicked.connect(lambda: self._open_comparison_tab(TestCategory.SECURITY))
+        side_layout.addWidget(self.compare_security_button)
 
         self.hint_label = QLabel(
             "使用方式:\n"
             "1. 勾选一个算法，打开单算法测试\n"
-            "2. 勾选多个算法，打开交叉对比测试\n"
+            "2. 勾选多个算法，打开性能或安全性交叉对比\n"
             "3. 右侧标签页可并行保留多个结果"
         )
         self.hint_label.setWordWrap(True)
@@ -279,18 +283,19 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(page)
         self._set_status(f"已打开 {algorithm_label(algorithm)} 的测试结果页。", warn=False)
 
-    def _open_comparison_tab(self) -> None:
+    def _open_comparison_tab(self, category: TestCategory) -> None:
         selected = self._checked_algorithm_names()
         if len(selected) < 2:
             self._set_status("交叉对比测试至少需要勾选两个算法。")
             return
-        page = ComparisonResultPage(selected)
+        page = ComparisonResultPage(selected, category)
         summary = " / ".join(algorithm_label(name) for name in selected[:2])
         if len(selected) > 2:
             summary += f" 等{len(selected)}个"
-        self.tabs.addTab(page, f"对比 | {summary}")
+        prefix = "性能对比" if category == TestCategory.PERFORMANCE else "安全对比"
+        self.tabs.addTab(page, f"{prefix} | {summary}")
         self.tabs.setCurrentWidget(page)
-        self._set_status(f"已打开 {len(selected)} 个算法的交叉对比结果页。", warn=False)
+        self._set_status(f"已打开 {len(selected)} 个算法的{prefix}结果页。", warn=False)
 
     def _close_tab(self, index: int) -> None:
         widget = self.tabs.widget(index)

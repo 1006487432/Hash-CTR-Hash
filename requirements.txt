@@ -5,3 +5,4 @@ pypdf>=5.0
 PyMuPDF>=1.24
 numpy>=1.26
 scipy>=1.13
+psutil>=5.9

@@ -431,11 +431,54 @@ class PerformanceLineChartCard(CardFrame):
         layout.addWidget(LineChartWidget(series))
 
 
+class KeyScheduleChartCard(CardFrame):
+    def __init__(self, result: TestResult, parent: QWidget | None = None):
+        super().__init__(alt=True, parent=parent)
+        artifacts = result.artifacts
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("密钥扩展复杂度概览")
+        title.setStyleSheet(f"font-size: 11.5pt; font-weight: 700; color: {TEXT};")
+        note = QLabel("按底层原语、子密钥派生数量和名义调度轮数评估密钥扩展负担。")
+        note.setStyleSheet(f"color: {MUTED};")
+        note.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(note)
+
+        chip_row = QHBoxLayout()
+        chip_row.setSpacing(8)
+        for label, value in [
+            ("原语", artifacts.get("primitive", "-")),
+            ("子密钥组数", artifacts.get("derived_key_count", 0)),
+            ("调度轮数", artifacts.get("schedule_rounds", 0)),
+            ("复杂度", artifacts.get("complexity_level", "-")),
+        ]:
+            chip = QLabel(f"{label}: {value}")
+            chip.setStyleSheet(
+                f"background: rgba(30,143,163,0.08); border-radius: 10px; padding: 5px 10px; color: {TEXT};"
+            )
+            chip_row.addWidget(chip)
+        chip_row.addStretch(1)
+        layout.addLayout(chip_row)
+
+        details = QLabel(str(artifacts.get("note", "")))
+        details.setWordWrap(True)
+        details.setStyleSheet(f"color: {TEXT};")
+        layout.addWidget(details)
+
+
 def build_performance_charts(results: Sequence[TestResult], parent: QWidget | None = None) -> list[QWidget]:
+    # 图表构建按 artifacts.kind 聚合结果，这样测试层新增指标时不会影响 GUI 其余部分。
     encrypt_latency: list[tuple[int, float]] = []
     decrypt_latency: list[tuple[int, float]] = []
     encrypt_throughput: list[tuple[int, float]] = []
     decrypt_throughput: list[tuple[int, float]] = []
+    encrypt_cpb: list[tuple[int, float]] = []
+    decrypt_cpb: list[tuple[int, float]] = []
+    memory_result: TestResult | None = None
+    key_schedule_result: TestResult | None = None
 
     for result in results:
         artifacts = result.artifacts
@@ -447,11 +490,21 @@ def build_performance_charts(results: Sequence[TestResult], parent: QWidget | No
             encrypt_throughput.append((int(artifacts.get("size", 0)), float(artifacts.get("throughput_mib_s", 0.0))))
         elif artifacts.get("operation") == "decrypt" and artifacts.get("kind") == "performance_throughput":
             decrypt_throughput.append((int(artifacts.get("size", 0)), float(artifacts.get("throughput_mib_s", 0.0))))
+        elif artifacts.get("operation") == "encrypt" and artifacts.get("kind") == "performance_cpb" and artifacts.get("cpb") is not None:
+            encrypt_cpb.append((int(artifacts.get("size", 0)), float(artifacts.get("cpb", 0.0))))
+        elif artifacts.get("operation") == "decrypt" and artifacts.get("kind") == "performance_cpb" and artifacts.get("cpb") is not None:
+            decrypt_cpb.append((int(artifacts.get("size", 0)), float(artifacts.get("cpb", 0.0))))
+        elif artifacts.get("kind") == "memory":
+            memory_result = result
+        elif artifacts.get("kind") == "key_schedule":
+            key_schedule_result = result
 
     encrypt_latency.sort(key=lambda item: item[0])
     decrypt_latency.sort(key=lambda item: item[0])
     encrypt_throughput.sort(key=lambda item: item[0])
     decrypt_throughput.sort(key=lambda item: item[0])
+    encrypt_cpb.sort(key=lambda item: item[0])
+    decrypt_cpb.sort(key=lambda item: item[0])
 
     cards: list[QWidget] = []
     if encrypt_latency or decrypt_latency:
@@ -478,6 +531,33 @@ def build_performance_charts(results: Sequence[TestResult], parent: QWidget | No
                 parent=parent,
             )
         )
+    if encrypt_cpb or decrypt_cpb:
+        cards.append(
+            PerformanceLineChartCard(
+                "周期/字节曲线 (cpb)",
+                "按消息长度展示每字节平均消耗的 CPU 时钟周期数，适合在不同 CPU 主频下做更稳定的横向比较。",
+                [
+                    ("加密 cpb", [value for _, value in encrypt_cpb]),
+                    ("解密 cpb", [value for _, value in decrypt_cpb]),
+                ],
+                parent=parent,
+            )
+        )
+    if memory_result is not None:
+        artifacts = memory_result.artifacts
+        cards.append(
+            PerformanceLineChartCard(
+                "峰值内存占用曲线",
+                "展示不同消息长度下的 Python 层峰值内存分配，适合比较实现的临时对象与缓冲区开销。",
+                [
+                    ("加密峰值 KiB", [float(value) for value in artifacts.get("encrypt_peak_kib", ())]),
+                    ("解密峰值 KiB", [float(value) for value in artifacts.get("decrypt_peak_kib", ())]),
+                ],
+                parent=parent,
+            )
+        )
+    if key_schedule_result is not None:
+        cards.append(KeyScheduleChartCard(key_schedule_result, parent=parent))
     return cards
 
 
@@ -491,6 +571,119 @@ def build_security_charts(result: TestResult, parent: QWidget | None = None) -> 
     if kind == "avalanche":
         return [AvalancheChartCard(result, parent=parent)]
     return []
+
+
+def build_comparison_performance_charts(reports: Sequence[AlgorithmReport], parent: QWidget | None = None) -> list[QWidget]:
+    # 交叉对比页取各算法在多档消息长度上的平均值，用于做统一口径的横向概览。
+    labels: list[str] = []
+    encrypt_latency: list[float] = []
+    decrypt_latency: list[float] = []
+    encrypt_throughput: list[float] = []
+    decrypt_throughput: list[float] = []
+    encrypt_cpb: list[float] = []
+    decrypt_cpb: list[float] = []
+    memory_peaks: list[float] = []
+    key_scores: list[float] = []
+
+    for report in reports:
+        short_label = algorithm_label(report.algorithm)
+        enc_perf = []
+        dec_perf = []
+        enc_tp = []
+        dec_tp = []
+        enc_cpb = []
+        dec_cpb = []
+        memory_peak = None
+        key_score = None
+        for result in report.results:
+            kind = result.artifacts.get("kind")
+            if kind == "performance" and result.artifacts.get("operation") == "encrypt":
+                enc_perf.append(float(result.artifacts.get("avg_us", 0.0)))
+            elif kind == "performance" and result.artifacts.get("operation") == "decrypt":
+                dec_perf.append(float(result.artifacts.get("avg_us", 0.0)))
+            elif kind == "performance_throughput" and result.artifacts.get("operation") == "encrypt":
+                enc_tp.append(float(result.artifacts.get("throughput_mib_s", 0.0)))
+            elif kind == "performance_throughput" and result.artifacts.get("operation") == "decrypt":
+                dec_tp.append(float(result.artifacts.get("throughput_mib_s", 0.0)))
+            elif kind == "performance_cpb" and result.artifacts.get("operation") == "encrypt" and result.artifacts.get("cpb") is not None:
+                enc_cpb.append(float(result.artifacts.get("cpb", 0.0)))
+            elif kind == "performance_cpb" and result.artifacts.get("operation") == "decrypt" and result.artifacts.get("cpb") is not None:
+                dec_cpb.append(float(result.artifacts.get("cpb", 0.0)))
+            elif kind == "memory":
+                memory_peak = max(
+                    max((float(value) for value in result.artifacts.get("encrypt_peak_kib", ())), default=0.0),
+                    max((float(value) for value in result.artifacts.get("decrypt_peak_kib", ())), default=0.0),
+                )
+            elif kind == "key_schedule":
+                key_score = float(result.artifacts.get("complexity_score", 0.0))
+
+        labels.append(short_label)
+        encrypt_latency.append(sum(enc_perf) / len(enc_perf) if enc_perf else 0.0)
+        decrypt_latency.append(sum(dec_perf) / len(dec_perf) if dec_perf else 0.0)
+        encrypt_throughput.append(sum(enc_tp) / len(enc_tp) if enc_tp else 0.0)
+        decrypt_throughput.append(sum(dec_tp) / len(dec_tp) if dec_tp else 0.0)
+        encrypt_cpb.append(sum(enc_cpb) / len(enc_cpb) if enc_cpb else 0.0)
+        decrypt_cpb.append(sum(dec_cpb) / len(dec_cpb) if dec_cpb else 0.0)
+        memory_peaks.append(memory_peak or 0.0)
+        key_scores.append(key_score or 0.0)
+
+    cards: list[QWidget] = []
+    if labels:
+        cards.append(
+            ComparisonMetricChartCard(
+                "加密时延横向对比",
+                "比较各算法平均单次加密耗时，数值越低通常越有利。",
+                labels,
+                encrypt_latency,
+                parent=parent,
+            )
+        )
+        cards.append(
+            ComparisonMetricChartCard(
+                "解密时延横向对比",
+                "比较各算法平均单次解密耗时，数值越低通常越有利。",
+                labels,
+                decrypt_latency,
+                parent=parent,
+            )
+        )
+        cards.append(
+            ComparisonMetricChartCard(
+                "加密吞吐量横向对比",
+                "比较各算法平均加密吞吐量，数值越高通常越有利。",
+                labels,
+                encrypt_throughput,
+                parent=parent,
+            )
+        )
+        cards.append(
+            ComparisonMetricChartCard(
+                "周期/字节横向对比 (加密)",
+                "比较各算法每字节平均消耗的 CPU 周期数，数值越低通常越有利。",
+                labels,
+                encrypt_cpb,
+                parent=parent,
+            )
+        )
+        cards.append(
+            ComparisonMetricChartCard(
+                "峰值内存占用横向对比",
+                "比较 Python 层实现的峰值内存开销，适合观察临时对象与缓冲区成本。",
+                labels,
+                memory_peaks,
+                parent=parent,
+            )
+        )
+        cards.append(
+            ComparisonMetricChartCard(
+                "密钥扩展复杂度横向对比",
+                "基于名义调度轮数和子密钥派生数量构造复杂度分值，数值越高表示密钥调度负担越大。",
+                labels,
+                key_scores,
+                parent=parent,
+            )
+        )
+    return cards
 
 
 def build_comparison_security_charts(reports: Sequence[AlgorithmReport], parent: QWidget | None = None) -> list[QWidget]:

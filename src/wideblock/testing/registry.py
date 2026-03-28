@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import statistics
 import time
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from hashlib import sha256
 from typing import Callable
 
 from ..registry import get_algorithm, list_algorithms
+from .analysis import run_analysis_suite
 from .models import AlgorithmReport, ComparisonReport, ComparisonRow, TestCategory, TestMetric, TestResult, TestStatus
 from .security import run_security_suite, security_overview
 
 
 _PERFORMANCE_SIZES = (16, 256, 4096, 16384)
+_PERFORMANCE_ANALYSIS_STEPS = 2
 _PERFORMANCE_WARMUP = 3
 _PERFORMANCE_MIN_TOTAL_BYTES = 256 * 1024
 _PERFORMANCE_MAX_ROUNDS = 80
@@ -108,18 +115,39 @@ def _benchmark_operation(operation, rounds: int) -> list[int]:
     return samples
 
 
-def _summarize_samples(samples_ns: list[int], size: int) -> dict[str, float]:
+def _cpu_frequency_ghz() -> float | None:
+    # cpb 需要一个当前主频估计值；若平台或依赖不支持，就退化为不输出该指标。
+    if psutil is None:
+        return None
+    try:
+        freq = psutil.cpu_freq()
+    except Exception:
+        return None
+    if freq is None:
+        return None
+    mhz = freq.current or freq.max or freq.min
+    if not mhz:
+        return None
+    return float(mhz) / 1000.0
+
+
+def _summarize_samples(samples_ns: list[int], size: int) -> dict[str, float | None]:
     mean_ns = statistics.mean(samples_ns)
     median_ns = statistics.median(samples_ns)
     min_ns = min(samples_ns)
     max_ns = max(samples_ns)
     throughput_mib_s = (size / (1024 * 1024)) / (mean_ns / 1_000_000_000)
+    freq_ghz = _cpu_frequency_ghz()
+    # GHz * ns 可以近似换算成时钟周期数，再除以消息长度得到 cycles per byte。
+    cpb = None if freq_ghz is None or size <= 0 else (mean_ns * freq_ghz) / float(size)
     return {
         "avg_us": mean_ns / 1000.0,
         "median_us": median_ns / 1000.0,
         "min_us": min_ns / 1000.0,
         "max_us": max_ns / 1000.0,
         "throughput_mib_s": throughput_mib_s,
+        "cpu_freq_ghz": freq_ghz,
+        "cpb": cpb,
     }
 
 
@@ -133,6 +161,7 @@ def run_performance_suite(
     progress_callback: ProgressCallback | None = None,
     item_callback: Callable[[list[TestResult]], None] | None = None,
 ) -> list[TestResult]:
+    # 性能测试按消息长度逐段产出结果，便于 GUI 做流式刷新而不是整套完成后一次性展示。
     cipher = get_algorithm(algorithm)
     encrypt = cipher["encrypt"]
     decrypt = cipher["decrypt"]
@@ -140,7 +169,7 @@ def run_performance_suite(
     tweak = _associated_data(algorithm, "performance")
 
     results: list[TestResult] = []
-    total_steps = len(_PERFORMANCE_SIZES)
+    total_steps = len(_PERFORMANCE_SIZES) + _PERFORMANCE_ANALYSIS_STEPS
     for step_index, size in enumerate(_PERFORMANCE_SIZES, start=1):
         if progress_callback is not None:
             progress_callback(step_index, total_steps, f"正在执行性能测试: {size} 字节")
@@ -213,11 +242,62 @@ def run_performance_suite(
                 ),
                 artifacts={"kind": "performance_throughput", "operation": "decrypt", "size": size, "rounds": rounds, **decrypt_stats},
             ),
+            TestResult(
+                category=TestCategory.PERFORMANCE,
+                name=f"周期/字节测试 {size} 字节（加密）",
+                status=TestStatus.INFO,
+                summary="基于 CPU 主频估算每字节平均消耗的 CPU 时钟周期数。",
+                metrics=(
+                    TestMetric("cpb", f"{encrypt_stats['cpb']:.4f}" if encrypt_stats['cpb'] is not None else "不可用"),
+                    TestMetric("CPU 频率", f"{encrypt_stats['cpu_freq_ghz']:.3f} GHz" if encrypt_stats['cpu_freq_ghz'] is not None else "不可用"),
+                    TestMetric("平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
+                ),
+                artifacts={"kind": "performance_cpb", "operation": "encrypt", "size": size, "rounds": rounds, **encrypt_stats},
+            ),
+            TestResult(
+                category=TestCategory.PERFORMANCE,
+                name=f"周期/字节测试 {size} 字节（解密）",
+                status=TestStatus.INFO,
+                summary="基于 CPU 主频估算每字节平均消耗的 CPU 时钟周期数。",
+                metrics=(
+                    TestMetric("cpb", f"{decrypt_stats['cpb']:.4f}" if decrypt_stats['cpb'] is not None else "不可用"),
+                    TestMetric("CPU 频率", f"{decrypt_stats['cpu_freq_ghz']:.3f} GHz" if decrypt_stats['cpu_freq_ghz'] is not None else "不可用"),
+                    TestMetric("平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
+                ),
+                artifacts={"kind": "performance_cpb", "operation": "decrypt", "size": size, "rounds": rounds, **decrypt_stats},
+            ),
         ]
         results.extend(chunk)
         if item_callback is not None:
             item_callback(chunk)
+
+    analysis_steps = [
+        ("正在执行内存占用分析", 0),
+        ("正在执行密钥扩展复杂度分析", 1),
+    ]
+    analysis_results = run_analysis_suite(algorithm)
+    for offset, (label, index_in_analysis) in enumerate(analysis_steps, start=1):
+        if progress_callback is not None:
+            progress_callback(len(_PERFORMANCE_SIZES) + offset, total_steps, label)
+        chunk = [analysis_results[index_in_analysis]]
+        results.extend(chunk)
+        if item_callback is not None:
+            item_callback(chunk)
     return results
+
+
+def run_category_report(algorithm: str, category: TestCategory) -> AlgorithmReport:
+    # 分类报告用于“单项测试”模式，只返回当前类别的结果，避免性能和安全性相互捆绑。
+    started = time.perf_counter()
+    if category == TestCategory.CORRECTNESS:
+        results = run_correctness_suite(algorithm)
+    elif category == TestCategory.PERFORMANCE:
+        results = run_performance_suite(algorithm)
+    elif category == TestCategory.SECURITY:
+        results = run_security_suite(algorithm)
+    else:
+        raise ValueError(f"unsupported category: {category}")
+    return _build_algorithm_report(algorithm, list(results), started)
 
 
 def run_algorithm_report(algorithm: str) -> AlgorithmReport:
@@ -228,6 +308,60 @@ def run_algorithm_report(algorithm: str) -> AlgorithmReport:
         *run_security_suite(algorithm),
     ]
     return _build_algorithm_report(algorithm, results, started)
+
+
+def run_category_report_stream(
+    algorithm: str,
+    category: TestCategory,
+    progress_callback: ProgressCallback | None = None,
+    partial_callback: PartialAlgorithmCallback | None = None,
+) -> AlgorithmReport:
+    # 流式版本会在每个阶段或每个性能分块完成后回传局部报告，供 GUI 更新进度和图表。
+    started = time.perf_counter()
+    results: list[TestResult] = []
+
+    if category == TestCategory.CORRECTNESS:
+        if progress_callback is not None:
+            progress_callback(0, 1, "准备执行正确性测试")
+        results.extend(run_correctness_suite(algorithm))
+        report = _build_algorithm_report(algorithm, results, started)
+        if partial_callback is not None:
+            partial_callback((report, category))
+        if progress_callback is not None:
+            progress_callback(1, 1, "正确性测试已完成")
+        return report
+
+    if category == TestCategory.PERFORMANCE:
+        if progress_callback is not None:
+            progress_callback(0, 1, "准备执行性能测试")
+
+        def on_perf_chunk(chunk: list[TestResult]) -> None:
+            results.extend(chunk)
+            if partial_callback is not None:
+                partial_callback((_build_algorithm_report(algorithm, results, started), category))
+
+        run_performance_suite(
+            algorithm,
+            progress_callback=lambda step, total, text: progress_callback(step, total, text) if progress_callback else None,
+            item_callback=on_perf_chunk,
+        )
+        report = _build_algorithm_report(algorithm, results, started)
+        if progress_callback is not None:
+            progress_callback(1, 1, "性能测试已完成")
+        return report
+
+    if category == TestCategory.SECURITY:
+        if progress_callback is not None:
+            progress_callback(0, 1, "准备执行安全性测试")
+        results.extend(run_security_suite(algorithm))
+        report = _build_algorithm_report(algorithm, results, started)
+        if partial_callback is not None:
+            partial_callback((report, category))
+        if progress_callback is not None:
+            progress_callback(1, 1, "安全性测试已完成")
+        return report
+
+    raise ValueError(f"unsupported category: {category}")
 
 
 def run_algorithm_report_stream(
@@ -284,6 +418,108 @@ def _performance_artifacts(report: AlgorithmReport, operation: str) -> list[dict
             continue
         artifacts.append(result.artifacts)
     return artifacts
+
+
+def _build_comparison_row(report: AlgorithmReport, category: TestCategory) -> ComparisonRow:
+    if category == TestCategory.PERFORMANCE:
+        enc_artifacts = _performance_artifacts(report, "encrypt")
+        dec_artifacts = _performance_artifacts(report, "decrypt")
+        enc_avg = statistics.mean(item["avg_us"] for item in enc_artifacts) if enc_artifacts else None
+        dec_avg = statistics.mean(item["avg_us"] for item in dec_artifacts) if dec_artifacts else None
+        enc_tp = statistics.mean(item["throughput_mib_s"] for item in enc_artifacts) if enc_artifacts else None
+        dec_tp = statistics.mean(item["throughput_mib_s"] for item in dec_artifacts) if dec_artifacts else None
+        note_parts = [f"总耗时 {report.runtime_ms:.1f} ms"]
+        if enc_tp is not None:
+            note_parts.append(f"加密吞吐 {enc_tp:.4f} MiB/s")
+        if dec_tp is not None:
+            note_parts.append(f"解密吞吐 {dec_tp:.4f} MiB/s")
+        return ComparisonRow(
+            algorithm=algorithm_label(report.algorithm),
+            correctness="-",
+            encrypt_speed=f"{enc_avg:.2f} 微秒/次" if enc_avg is not None else "-",
+            decrypt_speed=f"{dec_avg:.2f} 微秒/次" if dec_avg is not None else "-",
+            security="-",
+            notes="，".join(note_parts),
+        )
+
+    if category == TestCategory.SECURITY:
+        return ComparisonRow(
+            algorithm=algorithm_label(report.algorithm),
+            correctness="-",
+            encrypt_speed="-",
+            decrypt_speed="-",
+            security=security_overview(list(report.results)),
+            notes=f"总耗时 {report.runtime_ms:.1f} ms",
+        )
+
+    correctness_failed = sum(1 for result in report.results if result.category == TestCategory.CORRECTNESS and result.status == TestStatus.FAILED)
+    return ComparisonRow(
+        algorithm=algorithm_label(report.algorithm),
+        correctness="通过" if correctness_failed == 0 else f"失败 ({correctness_failed})",
+        encrypt_speed="-",
+        decrypt_speed="-",
+        security="-",
+        notes=f"总耗时 {report.runtime_ms:.1f} ms",
+    )
+
+
+def run_comparison_report_for_category(algorithms: list[str], category: TestCategory) -> ComparisonReport:
+    rows: list[ComparisonRow] = []
+    reports: list[AlgorithmReport] = []
+    if category == TestCategory.PERFORMANCE:
+        notes = [
+            "当前仅执行性能测试，不再触发安全性测试。",
+            "性能页展示平均加解密时延、吞吐量，并保留内存占用和密钥扩展复杂度分析。",
+        ]
+    elif category == TestCategory.SECURITY:
+        notes = [
+            "当前仅执行安全性测试，不再触发性能测试。",
+            "随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。",
+        ]
+    else:
+        notes = ["当前仅执行正确性对比。"]
+
+    for algorithm in algorithms:
+        report = run_category_report(algorithm, category)
+        reports.append(report)
+        rows.append(_build_comparison_row(report, category))
+    return ComparisonReport(rows=tuple(rows), notes=tuple(notes), reports=tuple(reports))
+
+
+def run_comparison_report_stream_for_category(
+    algorithms: list[str],
+    category: TestCategory,
+    progress_callback: ProgressCallback | None = None,
+    partial_callback: PartialComparisonCallback | None = None,
+) -> ComparisonReport:
+    rows: list[ComparisonRow] = []
+    reports: list[AlgorithmReport] = []
+    if category == TestCategory.PERFORMANCE:
+        notes = [
+            "当前仅执行性能测试，不再触发安全性测试。",
+            "性能页展示平均加解密时延、吞吐量，并保留内存占用和密钥扩展复杂度分析。",
+        ]
+    elif category == TestCategory.SECURITY:
+        notes = [
+            "当前仅执行安全性测试，不再触发性能测试。",
+            "随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。",
+        ]
+    else:
+        notes = ["当前仅执行正确性对比。"]
+
+    total = len(algorithms)
+    for index, algorithm in enumerate(algorithms, start=1):
+        if progress_callback is not None:
+            progress_callback(index - 1, total, f"正在测试 {algorithm_label(algorithm)}")
+        report = run_category_report(algorithm, category)
+        reports.append(report)
+        rows.append(_build_comparison_row(report, category))
+        partial = ComparisonReport(rows=tuple(rows), notes=tuple(notes), reports=tuple(reports))
+        if partial_callback is not None:
+            partial_callback(partial)
+        if progress_callback is not None:
+            progress_callback(index, total, f"已完成 {index}/{total} 个算法")
+    return ComparisonReport(rows=tuple(rows), notes=tuple(notes), reports=tuple(reports))
 
 
 def run_comparison_report(algorithms: list[str]) -> ComparisonReport:
