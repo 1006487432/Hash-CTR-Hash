@@ -31,6 +31,7 @@ _ALGORITHM_LABELS = {
     "hctr1_aes": "HCTR1 (AES)",
     "hctr1_sm4": "HCTR1 (SM4)",
     "hctr2": "HCTR2 (AES)",
+    "hctr2_sm4": "HCTR2 (SM4)",
     "xcbstar": "XCB* (AES)",
     "xcbstar_sm4": "XCB* (SM4)",
     "xcbv1": "XCBv1 (AES)",
@@ -67,6 +68,8 @@ def _associated_data(algorithm: str, case_id: str, length: int = 16) -> bytes:
 def _key_size_for_algorithm(algorithm: str) -> int:
     if algorithm in {"hctr1_aes", "hctr1_sm4", "hctr2"}:
         return 32
+    if algorithm == "hctr2_sm4":
+        return 16
     return 16
 
 
@@ -467,17 +470,11 @@ def run_comparison_report_for_category(algorithms: list[str], category: TestCate
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
     if category == TestCategory.PERFORMANCE:
-        notes = [
-            "当前仅执行性能测试，不再触发安全性测试。",
-            "性能页展示平均加解密时延、吞吐量，并保留内存占用和密钥扩展复杂度分析。",
-        ]
+        notes = []
     elif category == TestCategory.SECURITY:
-        notes = [
-            "当前仅执行安全性测试，不再触发性能测试。",
-            "随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。",
-        ]
+        notes = ["随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。"]
     else:
-        notes = ["当前仅执行正确性对比。"]
+        notes = []
 
     for algorithm in algorithms:
         report = run_category_report(algorithm, category)
@@ -495,17 +492,11 @@ def run_comparison_report_stream_for_category(
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
     if category == TestCategory.PERFORMANCE:
-        notes = [
-            "当前仅执行性能测试，不再触发安全性测试。",
-            "性能页展示平均加解密时延、吞吐量，并保留内存占用和密钥扩展复杂度分析。",
-        ]
+        notes = []
     elif category == TestCategory.SECURITY:
-        notes = [
-            "当前仅执行安全性测试，不再触发性能测试。",
-            "随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。",
-        ]
+        notes = ["随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。"]
     else:
-        notes = ["当前仅执行正确性对比。"]
+        notes = []
 
     total = len(algorithms)
     for index, algorithm in enumerate(algorithms, start=1):
@@ -525,10 +516,7 @@ def run_comparison_report_stream_for_category(
 def run_comparison_report(algorithms: list[str]) -> ComparisonReport:
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
-    notes = [
-        "交叉对比页当前展示统一基准下的往返正确性、平均加解密速度、平均加解密吞吐量，以及随机性/雪崩效应测试结论。",
-        "统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明或论文攻击复现实验。",
-    ]
+    notes = ["统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明。"]
     for algorithm in algorithms:
         report = run_algorithm_report(algorithm)
         reports.append(report)
@@ -564,10 +552,7 @@ def run_comparison_report_stream(
 ) -> ComparisonReport:
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
-    notes = [
-        "交叉对比页当前展示统一基准下的往返正确性、平均加解密速度、平均加解密吞吐量，以及随机性/雪崩效应测试结论。",
-        "统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明或论文攻击复现实验。",
-    ]
+    notes = ["统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明。"]
     total = len(algorithms)
     for index, algorithm in enumerate(algorithms, start=1):
         if progress_callback is not None:

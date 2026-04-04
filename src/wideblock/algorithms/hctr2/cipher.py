@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from ...common import BLOCK_SIZE, aes_decrypt_block, aes_encrypt_block, xor_bytes
+from ...common import (
+    BLOCK_SIZE,
+    aes_decrypt_block,
+    aes_encrypt_block,
+    sm4_decrypt_block,
+    sm4_encrypt_block,
+    xor_bytes,
+)
 
 
 _AES_KEY_SIZES = {16, 24, 32}
@@ -11,6 +18,11 @@ _POLYVAL_CONST = sum(1 << power for power in [127, 124, 121, 114, 0])
 def _validate_aes_key(key: bytes) -> None:
     if len(key) not in _AES_KEY_SIZES:
         raise ValueError("HCTR2 AES key must be 16, 24, or 32 bytes")
+
+
+def _validate_sm4_key(key: bytes) -> None:
+    if len(key) != BLOCK_SIZE:
+        raise ValueError("HCTR2 SM4 key must be 16 bytes")
 
 
 def _pad_block_aligned(data: bytes) -> bytes:
@@ -67,11 +79,11 @@ def _hctr2_hash(hash_key: bytes, message: bytes, tweak: bytes) -> bytes:
     return _polyval_hash(hash_key, bytes(blocks))
 
 
-def _schedule_block(key: bytes, index: int) -> bytes:
-    return aes_encrypt_block(key, index.to_bytes(BLOCK_SIZE, "little"))
+def _schedule_block(key: bytes, index: int, encrypt_block) -> bytes:
+    return encrypt_block(key, index.to_bytes(BLOCK_SIZE, "little"))
 
 
-def _xctr_transform(key: bytes, data: bytes, nonce: bytes) -> bytes:
+def _xctr_transform(key: bytes, data: bytes, nonce: bytes, encrypt_block) -> bytes:
     if len(nonce) != BLOCK_SIZE:
         raise ValueError("HCTR2 nonce must be 16 bytes")
 
@@ -80,41 +92,59 @@ def _xctr_transform(key: bytes, data: bytes, nonce: bytes) -> bytes:
     while len(stream) < len(data):
         counter += 1
         counter_block = counter.to_bytes(BLOCK_SIZE, "little")
-        stream.extend(aes_encrypt_block(key, xor_bytes(nonce, counter_block)))
+        stream.extend(encrypt_block(key, xor_bytes(nonce, counter_block)))
     return xor_bytes(data, bytes(stream[: len(data)]))
 
 
-def hctr2_aes_encrypt(key: bytes, plaintext: bytes, tweak: bytes = b"") -> bytes:
-    _validate_aes_key(key)
+def _encrypt(key: bytes, plaintext: bytes, tweak: bytes, encrypt_block) -> bytes:
     if len(plaintext) < BLOCK_SIZE:
         raise ValueError("HCTR2 plaintext must be at least 16 bytes")
 
-    hash_key = _schedule_block(key, 0)
-    l_value = _schedule_block(key, 1)
+    hash_key = _schedule_block(key, 0, encrypt_block)
+    l_value = _schedule_block(key, 1, encrypt_block)
     m_block = plaintext[:BLOCK_SIZE]
     n_data = plaintext[BLOCK_SIZE:]
 
     masked_m = xor_bytes(m_block, _hctr2_hash(hash_key, n_data, tweak))
-    encrypted_masked_m = aes_encrypt_block(key, masked_m)
+    encrypted_masked_m = encrypt_block(key, masked_m)
     stream_nonce = xor_bytes(xor_bytes(masked_m, encrypted_masked_m), l_value)
-    v_data = _xctr_transform(key, n_data, stream_nonce)
+    v_data = _xctr_transform(key, n_data, stream_nonce, encrypt_block)
     u_block = xor_bytes(encrypted_masked_m, _hctr2_hash(hash_key, v_data, tweak))
     return u_block + v_data
 
 
-def hctr2_aes_decrypt(key: bytes, ciphertext: bytes, tweak: bytes = b"") -> bytes:
-    _validate_aes_key(key)
+def _decrypt(key: bytes, ciphertext: bytes, tweak: bytes, encrypt_block, decrypt_block) -> bytes:
     if len(ciphertext) < BLOCK_SIZE:
         raise ValueError("HCTR2 ciphertext must be at least 16 bytes")
 
-    hash_key = _schedule_block(key, 0)
-    l_value = _schedule_block(key, 1)
+    hash_key = _schedule_block(key, 0, encrypt_block)
+    l_value = _schedule_block(key, 1, encrypt_block)
     u_block = ciphertext[:BLOCK_SIZE]
     v_data = ciphertext[BLOCK_SIZE:]
 
     encrypted_masked_m = xor_bytes(u_block, _hctr2_hash(hash_key, v_data, tweak))
-    masked_m = aes_decrypt_block(key, encrypted_masked_m)
+    masked_m = decrypt_block(key, encrypted_masked_m)
     stream_nonce = xor_bytes(xor_bytes(masked_m, encrypted_masked_m), l_value)
-    n_data = _xctr_transform(key, v_data, stream_nonce)
+    n_data = _xctr_transform(key, v_data, stream_nonce, encrypt_block)
     m_block = xor_bytes(masked_m, _hctr2_hash(hash_key, n_data, tweak))
     return m_block + n_data
+
+
+def hctr2_aes_encrypt(key: bytes, plaintext: bytes, tweak: bytes = b"") -> bytes:
+    _validate_aes_key(key)
+    return _encrypt(key, plaintext, tweak, aes_encrypt_block)
+
+
+def hctr2_aes_decrypt(key: bytes, ciphertext: bytes, tweak: bytes = b"") -> bytes:
+    _validate_aes_key(key)
+    return _decrypt(key, ciphertext, tweak, aes_encrypt_block, aes_decrypt_block)
+
+
+def hctr2_sm4_encrypt(key: bytes, plaintext: bytes, tweak: bytes = b"") -> bytes:
+    _validate_sm4_key(key)
+    return _encrypt(key, plaintext, tweak, sm4_encrypt_block)
+
+
+def hctr2_sm4_decrypt(key: bytes, ciphertext: bytes, tweak: bytes = b"") -> bytes:
+    _validate_sm4_key(key)
+    return _decrypt(key, ciphertext, tweak, sm4_encrypt_block, sm4_decrypt_block)

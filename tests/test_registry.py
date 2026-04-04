@@ -49,6 +49,7 @@ def main() -> int:
         "hctr1_aes",
         "hctr1_sm4",
         "hctr2",
+        "hctr2_sm4",
         "xcbstar",
         "xcbstar_sm4",
         "xcbv1",

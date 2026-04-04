@@ -25,6 +25,8 @@ def _sample_bytes(label: str, length: int) -> bytes:
 def _key_size_for_algorithm(algorithm: str) -> int:
     if algorithm in {"hctr1_aes", "hctr1_sm4", "hctr2"}:
         return 32
+    if algorithm == "hctr2_sm4":
+        return 16
     return 16
 
 

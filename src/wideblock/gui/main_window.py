@@ -22,7 +22,7 @@ from .pages import AlgorithmResultPage, ComparisonResultPage
 
 _GROUPS = {
     "HCH 系列": ["hch_aes", "hch_sm4"],
-    "HCTR 系列": ["hctr1_aes", "hctr1_sm4", "hctr2"],
+    "HCTR 系列": ["hctr1_aes", "hctr1_sm4", "hctr2", "hctr2_sm4"],
     "XCB 系列": ["xcbstar", "xcbstar_sm4", "xcbv1", "xcbv1_sm4", "xcbv2", "xcbv2_sm4"],
 }
 

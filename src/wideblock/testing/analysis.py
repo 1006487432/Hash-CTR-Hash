@@ -33,6 +33,7 @@ _KEY_SCHEDULE_PROFILES: dict[str, KeyScheduleProfile] = {
     "hctr1_aes": KeyScheduleProfile("AES", 32, 16, 2, 20, "split", 20, "中", "32 字节输入被拆成 K1||K2，两组 AES-128 调度分别承担数据层和哈希层。"),
     "hctr1_sm4": KeyScheduleProfile("SM4", 32, 16, 2, 64, "split", 64, "高", "32 字节输入被拆成 K1||K2，两组 SM4 轮密钥分别承担数据层和哈希层。"),
     "hctr2": KeyScheduleProfile("AES", 32, 32, 1, 14, "single_with_derived_masks", 14, "中", "单个 AES-256 调度后，通过加密常量块导出 hash key 与 L 值。"),
+    "hctr2_sm4": KeyScheduleProfile("SM4", 16, 16, 1, 32, "single_with_derived_masks", 32, "中", "单个 SM4 调度后，通过加密常量块导出 hash key 与 L 值。"),
     "xcbstar": KeyScheduleProfile("AES", 16, 16, 5, 50, "derived_subkeys", 50, "高", "基于主密钥派生 5 个子密钥，左右两层都参与变换。"),
     "xcbstar_sm4": KeyScheduleProfile("SM4", 16, 16, 5, 160, "derived_subkeys", 160, "高", "基于主密钥派生 5 个 SM4 子密钥，左右两层都参与变换。"),
     "xcbv1": KeyScheduleProfile("AES", 16, 16, 5, 50, "derived_subkeys", 50, "高", "基于主密钥派生 5 个子密钥，内部轮函数多次复用。"),

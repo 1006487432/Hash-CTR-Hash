@@ -9,7 +9,7 @@ from .algorithms.hctr1.cipher import (
     hctr1_sm4_decrypt,
     hctr1_sm4_encrypt,
 )
-from .algorithms.hctr2.cipher import hctr2_aes_decrypt, hctr2_aes_encrypt
+from .algorithms.hctr2.cipher import hctr2_aes_decrypt, hctr2_aes_encrypt, hctr2_sm4_decrypt, hctr2_sm4_encrypt
 from .algorithms.xcbstar.cipher import (
     xcbstar_aes_decrypt,
     xcbstar_aes_encrypt,
@@ -39,6 +39,7 @@ ALGORITHMS: dict[str, dict[str, CipherFn]] = {
     "hctr1_aes": {"encrypt": hctr1_aes_encrypt, "decrypt": hctr1_aes_decrypt},
     "hctr1_sm4": {"encrypt": hctr1_sm4_encrypt, "decrypt": hctr1_sm4_decrypt},
     "hctr2": {"encrypt": hctr2_aes_encrypt, "decrypt": hctr2_aes_decrypt},
+    "hctr2_sm4": {"encrypt": hctr2_sm4_encrypt, "decrypt": hctr2_sm4_decrypt},
     "xcbstar": {"encrypt": xcbstar_aes_encrypt, "decrypt": xcbstar_aes_decrypt},
     "xcbstar_sm4": {"encrypt": xcbstar_sm4_encrypt, "decrypt": xcbstar_sm4_decrypt},
     "xcbv1": {"encrypt": xcb_aes_v1_encrypt, "decrypt": xcb_aes_v1_decrypt},
