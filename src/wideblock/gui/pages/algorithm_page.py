@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget
+from pathlib import Path
 
-from ...testing import AlgorithmReport, TestCategory, algorithm_label, run_category_report_stream
+from PySide6.QtWidgets import QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget
+
+from ...testing import AlgorithmReport, TestCategory, algorithm_label, run_algorithm_report, run_algorithm_report_stream, run_category_report_stream
+from ...testing.report import generate_report
 from ..widgets import MetricCard, ResultCard, build_performance_charts, build_security_charts
 from ..workers import start_streaming_task
 
@@ -34,6 +37,20 @@ class AlgorithmResultPage(QWidget):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(14)
 
+        self.toggle_top_btn = QPushButton("收起测试信息与操作面板 ▴")
+        self.toggle_top_btn.setCheckable(True)
+        self.toggle_top_btn.setStyleSheet(
+            "QPushButton { border: none; color: #5f7382; font-weight: bold; text-align: left; padding: 4px; }"
+            "QPushButton:hover { color: #18242d; }"
+        )
+        self.toggle_top_btn.clicked.connect(self._toggle_top_panel)
+        root.addWidget(self.toggle_top_btn)
+
+        self.top_panel = QWidget()
+        top_layout = QVBoxLayout(self.top_panel)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(14)
+
         hero = QFrame()
         hero.setObjectName("contentShell")
         hero_layout = QVBoxLayout(hero)
@@ -62,6 +79,10 @@ class AlgorithmResultPage(QWidget):
                 button.setProperty("class", "primary")
             self._buttons[category] = button
             button_row.addWidget(button)
+
+        self.report_button = QPushButton("生成完整报告")
+        self.report_button.clicked.connect(self._generate_report)
+        button_row.addWidget(self.report_button)
         button_row.addStretch(1)
         hero_layout.addLayout(button_row)
 
@@ -73,7 +94,7 @@ class AlgorithmResultPage(QWidget):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         hero_layout.addWidget(self.progress_bar)
-        root.addWidget(hero)
+        top_layout.addWidget(hero)
 
         metrics_row = QHBoxLayout()
         metrics_row.setSpacing(12)
@@ -84,7 +105,9 @@ class AlgorithmResultPage(QWidget):
         self.metric_checks = MetricCard("已完成项", "-")
         for card in [self.metric_algorithm, self.metric_passed, self.metric_failed, self.metric_runtime, self.metric_checks]:
             metrics_row.addWidget(card)
-        root.addLayout(metrics_row)
+        top_layout.addLayout(metrics_row)
+        
+        root.addWidget(self.top_panel)
 
         self.category_tabs = QTabWidget()
         self.category_tabs.setDocumentMode(True)
@@ -111,6 +134,13 @@ class AlgorithmResultPage(QWidget):
             self._category_layouts[category] = container_layout
             self.category_tabs.addTab(page, _CATEGORY_TEXT[category])
         root.addWidget(self.category_tabs, 1)
+
+    def _toggle_top_panel(self, checked: bool) -> None:
+        self.top_panel.setVisible(not checked)
+        if checked:
+            self.toggle_top_btn.setText("展开测试信息与操作面板 ▾")
+        else:
+            self.toggle_top_btn.setText("收起测试信息与操作面板 ▴")
 
     def _clear_layout(self, layout: QVBoxLayout) -> None:
         while layout.count():
@@ -230,3 +260,87 @@ class AlgorithmResultPage(QWidget):
         self._update_metrics()
         self._render_category(category)
         self.category_tabs.setCurrentIndex(list(TestCategory).index(category))
+
+    def _generate_report(self) -> None:
+        if not self._category_reports:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setWindowTitle("运行完整测试")
+            msg.setText("尚未运行任何测试。是否立即运行完整测试（正确性+性能+安全性）并生成报告？")
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            reply = msg.exec()
+            if reply == QMessageBox.StandardButton.Yes:
+                self._run_full_test_and_report()
+            return
+
+        default_path = Path.cwd() / "reports" / f"{self.algorithm}_report.md"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存测试报告",
+            str(default_path),
+            "Markdown 文件 (*.md);;所有文件 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            all_results = []
+            total_runtime = 0.0
+            for category in [TestCategory.CORRECTNESS, TestCategory.PERFORMANCE, TestCategory.SECURITY]:
+                if category in self._category_reports:
+                    report = self._category_reports[category]
+                    all_results.extend(report.results)
+                    total_runtime += report.runtime_ms
+
+            combined_report = AlgorithmReport(
+                algorithm=self.algorithm,
+                results=tuple(all_results),
+                runtime_ms=total_runtime
+            )
+
+            generate_report(combined_report, Path(file_path))
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setWindowTitle("报告生成成功")
+            msg.setText(f"测试报告已保存至:\n{file_path}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+        except Exception as e:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("报告生成失败")
+            msg.setText(f"生成报告时发生错误:\n{str(e)}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+
+    def _run_full_test_and_report(self) -> None:
+        self._set_buttons_enabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_text.setText("准备执行完整测试...")
+        start_streaming_task(
+            run_algorithm_report_stream,
+            self._on_full_test_complete,
+            self._show_error,
+            self._show_progress,
+            self._show_partial,
+            self.algorithm,
+        )
+
+    def _on_full_test_complete(self, report: AlgorithmReport) -> None:
+        self._set_buttons_enabled(True)
+        self.progress_bar.setValue(100)
+        self.progress_text.setText("完整测试已完成")
+        for category in TestCategory:
+            category_results = [r for r in report.results if r.category == category]
+            if category_results:
+                cat_report = AlgorithmReport(
+                    algorithm=report.algorithm,
+                    results=tuple(category_results),
+                    runtime_ms=report.runtime_ms / 3
+                )
+                self._category_reports[category] = cat_report
+                self._render_category(category)
+        self._update_metrics()
+        self._generate_report()

@@ -4,6 +4,7 @@ import statistics
 from hashlib import sha256
 
 from .gbt32915 import run_gbt32915_suite
+from .xcbstar_cycle import run_xcbstar_cycle_attack_poc
 from ..registry import get_algorithm
 from .models import TestCategory, TestMetric, TestResult, TestStatus
 
@@ -117,8 +118,44 @@ def run_avalanche_test(algorithm: str) -> TestResult:
     )
 
 
+def run_xcbstar_cycle_attack_test() -> TestResult:
+    transcript = run_xcbstar_cycle_attack_poc()
+    success = transcript.decrypted_forgery == transcript.forged_plaintext
+    return TestResult(
+        category=TestCategory.SECURITY,
+        name="XCB*循环攻击复现",
+        status=TestStatus.WARNING if success else TestStatus.FAILED,
+        summary=(
+            "弱hash key条件下可由一个合法明密文对构造新合法密文。"
+            if success
+            else "循环攻击复现实验未产生预期伪造结果。"
+        ),
+        details=(
+            "白盒设置k1=k3为GF(2^128)乘法单位元，使两处hash同时满足低阶条件；"
+            "对B和E的相邻两个block施加相同差分，验证G保持不变且伪造密文可解密为伪造明文。"
+        ),
+        metrics=(
+            TestMetric("弱key阶数", str(transcript.distance)),
+            TestMetric("差分长度", f"{len(transcript.delta)} bytes"),
+            TestMetric("伪造验证", "成功" if success else "失败"),
+        ),
+        artifacts={
+            "kind": "xcbstar_cycle_attack",
+            "success": success,
+            "delta": transcript.delta.hex(),
+            "delta_block": transcript.delta_block.hex(),
+            "plaintext": transcript.plaintext.hex(),
+            "ciphertext": transcript.ciphertext.hex(),
+            "forged_plaintext": transcript.forged_plaintext.hex(),
+            "forged_ciphertext": transcript.forged_ciphertext.hex(),
+        },
+    )
+
+
 def run_security_suite(algorithm: str) -> list[TestResult]:
     results = [*run_gbt32915_suite(algorithm), run_avalanche_test(algorithm)]
+    if algorithm == "xcbstar":
+        results.append(run_xcbstar_cycle_attack_test())
     if algorithm.startswith("xcb"):
         results.append(
             TestResult(

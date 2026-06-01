@@ -4,3 +4,8 @@ tmp*
 image
 image/*
 中期*
+*.docx
+本科*
+code-*
+reports/
+附件2*

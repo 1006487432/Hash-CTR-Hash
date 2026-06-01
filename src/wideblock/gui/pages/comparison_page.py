@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
 from ...testing import ComparisonReport, TestCategory, algorithm_label, run_comparison_report_stream_for_category
+from ...testing.report import generate_report
 from ..widgets import MetricCard, build_comparison_performance_charts, build_comparison_security_charts
 from ..workers import start_streaming_task
 
@@ -28,6 +31,20 @@ class ComparisonResultPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(14)
+
+        self.toggle_top_btn = QPushButton("收起对比信息与操作面板 ▴")
+        self.toggle_top_btn.setCheckable(True)
+        self.toggle_top_btn.setStyleSheet(
+            "QPushButton { border: none; color: #5f7382; font-weight: bold; text-align: left; padding: 4px; }"
+            "QPushButton:hover { color: #18242d; }"
+        )
+        self.toggle_top_btn.clicked.connect(self._toggle_top_panel)
+        root.addWidget(self.toggle_top_btn)
+
+        self.top_panel = QWidget()
+        top_layout = QVBoxLayout(self.top_panel)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(14)
 
         hero = QFrame()
         hero.setObjectName("contentShell")
@@ -63,7 +80,12 @@ class ComparisonResultPage(QWidget):
         self.run_button.setProperty("class", "primary")
         self.run_button.clicked.connect(self._run_report)
         hero_layout.addWidget(self.run_button, 0, Qt.AlignmentFlag.AlignTop)
-        root.addWidget(hero)
+
+        self.report_button = QPushButton("生成报告")
+        self.report_button.clicked.connect(self._generate_report)
+        self.report_button.setEnabled(False)
+        hero_layout.addWidget(self.report_button, 0, Qt.AlignmentFlag.AlignTop)
+        top_layout.addWidget(hero)
 
         metrics_row = QHBoxLayout()
         metrics_row.setSpacing(12)
@@ -78,7 +100,9 @@ class ComparisonResultPage(QWidget):
             self.metric_status = MetricCard("已完成算法", "-")
         for card in [self.metric_count, self.metric_primary, self.metric_secondary, self.metric_status]:
             metrics_row.addWidget(card)
-        root.addLayout(metrics_row)
+        top_layout.addLayout(metrics_row)
+
+        root.addWidget(self.top_panel)
 
         self.content_scroll = QScrollArea()
         self.content_scroll.setWidgetResizable(True)
@@ -138,6 +162,13 @@ class ComparisonResultPage(QWidget):
         note_layout.addStretch(1)
         self.content_layout.addWidget(note_card)
 
+    def _toggle_top_panel(self, checked: bool) -> None:
+        self.top_panel.setVisible(not checked)
+        if checked:
+            self.toggle_top_btn.setText("展开对比信息与操作面板 ▾")
+        else:
+            self.toggle_top_btn.setText("收起对比信息与操作面板 ▴")
+
     def _clear_chart_grid(self) -> None:
         while self.chart_grid.count():
             item = self.chart_grid.takeAt(0)
@@ -184,11 +215,51 @@ class ComparisonResultPage(QWidget):
         self._clear_chart_grid()
 
     def _show_report(self, report: ComparisonReport) -> None:
+        self.current_report = report
         self.run_button.setEnabled(True)
         self.run_button.setText("重新运行")
+        self.report_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.progress_text.setText(f"{_MODE_TEXT[self.category]}已完成")
         self._render_report(report, partial=False)
+
+    def _generate_report(self) -> None:
+        if not hasattr(self, 'current_report') or self.current_report is None:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("无法生成报告")
+            msg.setText("请先运行对比测试后再生成报告。")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+            return
+
+        category_suffix = "performance" if self.category == TestCategory.PERFORMANCE else "security"
+        default_path = Path.cwd() / "reports" / f"comparison_{category_suffix}_report.md"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存对比报告",
+            str(default_path),
+            "Markdown 文件 (*.md);;所有文件 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            generate_report(self.current_report, Path(file_path))
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setWindowTitle("报告生成成功")
+            msg.setText(f"对比报告已保存至:\n{file_path}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+        except Exception as e:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("报告生成失败")
+            msg.setText(f"生成报告时发生错误:\n{str(e)}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
 
     def _render_report(self, report: ComparisonReport, *, partial: bool) -> None:
         self.metric_count.set_value(str(len(report.rows)))

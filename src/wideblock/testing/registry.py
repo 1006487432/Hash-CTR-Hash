@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import statistics
 import time
 
@@ -18,9 +19,10 @@ from .security import run_security_suite, security_overview
 
 _PERFORMANCE_SIZES = (16, 256, 4096, 16384)
 _PERFORMANCE_ANALYSIS_STEPS = 2
-_PERFORMANCE_WARMUP = 3
-_PERFORMANCE_MIN_TOTAL_BYTES = 256 * 1024
-_PERFORMANCE_MAX_ROUNDS = 80
+_PERFORMANCE_WARMUP = 5
+_PERFORMANCE_REPETITIONS = 3
+_PERFORMANCE_MIN_TOTAL_BYTES = 512 * 1024
+_PERFORMANCE_MAX_ROUNDS = 120
 _CORRECTNESS_SIZES = (16, 31, 128)
 _FIXED_TWEAK_ALGORITHMS = {"hch_aes", "hch_sm4", "hctr1_aes", "hctr1_sm4"}
 
@@ -111,10 +113,18 @@ def run_correctness_suite(algorithm: str) -> list[TestResult]:
 
 def _benchmark_operation(operation, rounds: int) -> list[int]:
     samples: list[int] = []
-    for _ in range(rounds):
-        started = time.perf_counter_ns()
-        operation()
-        samples.append(time.perf_counter_ns() - started)
+    gc.collect()
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        for _ in range(rounds):
+            started = time.perf_counter_ns()
+            operation()
+            samples.append(time.perf_counter_ns() - started)
+    finally:
+        if was_enabled:
+            gc.enable()
     return samples
 
 
@@ -139,6 +149,8 @@ def _summarize_samples(samples_ns: list[int], size: int) -> dict[str, float | No
     median_ns = statistics.median(samples_ns)
     min_ns = min(samples_ns)
     max_ns = max(samples_ns)
+    stdev_ns = statistics.stdev(samples_ns) if len(samples_ns) > 1 else 0.0
+    relative_stdev = stdev_ns / mean_ns if mean_ns else 0.0
     throughput_mib_s = (size / (1024 * 1024)) / (mean_ns / 1_000_000_000)
     freq_ghz = _cpu_frequency_ghz()
     # GHz * ns 可以近似换算成时钟周期数，再除以消息长度得到 cycles per byte。
@@ -148,9 +160,33 @@ def _summarize_samples(samples_ns: list[int], size: int) -> dict[str, float | No
         "median_us": median_ns / 1000.0,
         "min_us": min_ns / 1000.0,
         "max_us": max_ns / 1000.0,
+        "stdev_us": stdev_ns / 1000.0,
+        "relative_stdev": relative_stdev,
         "throughput_mib_s": throughput_mib_s,
         "cpu_freq_ghz": freq_ghz,
         "cpb": cpb,
+    }
+
+
+def _median_or_none(values: list[float | None]) -> float | None:
+    filtered = [value for value in values if value is not None]
+    if not filtered:
+        return None
+    return float(statistics.median(filtered))
+
+
+def _aggregate_stats(runs: list[dict[str, float | None]]) -> dict[str, float | None]:
+    return {
+        "avg_us": _median_or_none([item["avg_us"] for item in runs]),
+        "median_us": _median_or_none([item["median_us"] for item in runs]),
+        "min_us": _median_or_none([item["min_us"] for item in runs]),
+        "max_us": _median_or_none([item["max_us"] for item in runs]),
+        "stdev_us": _median_or_none([item["stdev_us"] for item in runs]),
+        "relative_stdev": _median_or_none([item["relative_stdev"] for item in runs]),
+        "throughput_mib_s": _median_or_none([item["throughput_mib_s"] for item in runs]),
+        "cpu_freq_ghz": _median_or_none([item["cpu_freq_ghz"] for item in runs]),
+        "cpb": _median_or_none([item["cpb"] for item in runs]),
+        "repeat_count": float(len(runs)),
     }
 
 
@@ -165,6 +201,7 @@ def run_performance_suite(
     item_callback: Callable[[list[TestResult]], None] | None = None,
 ) -> list[TestResult]:
     # 性能测试按消息长度逐段产出结果，便于 GUI 做流式刷新而不是整套完成后一次性展示。
+    # 每个消息长度会重复执行多轮，再用中位数降低偶发抖动对报告的影响。
     cipher = get_algorithm(algorithm)
     encrypt = cipher["encrypt"]
     decrypt = cipher["decrypt"]
@@ -175,7 +212,7 @@ def run_performance_suite(
     total_steps = len(_PERFORMANCE_SIZES) + _PERFORMANCE_ANALYSIS_STEPS
     for step_index, size in enumerate(_PERFORMANCE_SIZES, start=1):
         if progress_callback is not None:
-            progress_callback(step_index, total_steps, f"正在执行性能测试: {size} 字节")
+            progress_callback(step_index, total_steps, f"正在执行性能测试: {size} 字节（{_PERFORMANCE_REPETITIONS} 轮）")
 
         plaintext = _sample_bytes(f"{algorithm}:perf:{size}", size)
         ciphertext = encrypt(key, plaintext, tweak)
@@ -187,39 +224,43 @@ def run_performance_suite(
             encrypt_call()
             decrypt_call()
 
-        encrypt_samples = _benchmark_operation(encrypt_call, rounds)
-        decrypt_samples = _benchmark_operation(decrypt_call, rounds)
-        encrypt_stats = _summarize_samples(encrypt_samples, size)
-        decrypt_stats = _summarize_samples(decrypt_samples, size)
+        encrypt_runs = [_summarize_samples(_benchmark_operation(encrypt_call, rounds), size) for _ in range(_PERFORMANCE_REPETITIONS)]
+        decrypt_runs = [_summarize_samples(_benchmark_operation(decrypt_call, rounds), size) for _ in range(_PERFORMANCE_REPETITIONS)]
+        encrypt_stats = _aggregate_stats(encrypt_runs)
+        decrypt_stats = _aggregate_stats(decrypt_runs)
 
         chunk = [
             TestResult(
                 category=TestCategory.PERFORMANCE,
                 name=f"加密速度测试 {size} 字节",
                 status=TestStatus.INFO,
-                summary="统计单次加密耗时。",
+                summary=f"统计 {_PERFORMANCE_REPETITIONS} 轮加密耗时的中位数。",
                 metrics=(
-                    TestMetric("平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("中位平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
                     TestMetric("中位耗时", f"{encrypt_stats['median_us']:.2f} 微秒/次"),
                     TestMetric("最小耗时", f"{encrypt_stats['min_us']:.2f} 微秒/次"),
                     TestMetric("最大耗时", f"{encrypt_stats['max_us']:.2f} 微秒/次"),
+                    TestMetric("相对标准差", f"{encrypt_stats['relative_stdev'] * 100:.2f}%"),
+                    TestMetric("重复轮数", str(_PERFORMANCE_REPETITIONS)),
                     TestMetric("轮数", str(rounds)),
                 ),
-                artifacts={"kind": "performance", "operation": "encrypt", "size": size, "rounds": rounds, **encrypt_stats},
+                artifacts={"kind": "performance", "operation": "encrypt", "size": size, "rounds": rounds, "repetitions": _PERFORMANCE_REPETITIONS, **encrypt_stats},
             ),
             TestResult(
                 category=TestCategory.PERFORMANCE,
                 name=f"解密速度测试 {size} 字节",
                 status=TestStatus.INFO,
-                summary="统计单次解密耗时。",
+                summary=f"统计 {_PERFORMANCE_REPETITIONS} 轮解密耗时的中位数。",
                 metrics=(
-                    TestMetric("平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("中位平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
                     TestMetric("中位耗时", f"{decrypt_stats['median_us']:.2f} 微秒/次"),
                     TestMetric("最小耗时", f"{decrypt_stats['min_us']:.2f} 微秒/次"),
                     TestMetric("最大耗时", f"{decrypt_stats['max_us']:.2f} 微秒/次"),
+                    TestMetric("相对标准差", f"{decrypt_stats['relative_stdev'] * 100:.2f}%"),
+                    TestMetric("重复轮数", str(_PERFORMANCE_REPETITIONS)),
                     TestMetric("轮数", str(rounds)),
                 ),
-                artifacts={"kind": "performance", "operation": "decrypt", "size": size, "rounds": rounds, **decrypt_stats},
+                artifacts={"kind": "performance", "operation": "decrypt", "size": size, "rounds": rounds, "repetitions": _PERFORMANCE_REPETITIONS, **decrypt_stats},
             ),
             TestResult(
                 category=TestCategory.PERFORMANCE,
@@ -228,10 +269,11 @@ def run_performance_suite(
                 summary="统计连续加密的数据处理吞吐量。",
                 metrics=(
                     TestMetric("吞吐量", f"{encrypt_stats['throughput_mib_s']:.4f} MiB/s"),
-                    TestMetric("平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("中位平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
                     TestMetric("总数据量", f"{size * rounds} 字节"),
+                    TestMetric("重复轮数", str(_PERFORMANCE_REPETITIONS)),
                 ),
-                artifacts={"kind": "performance_throughput", "operation": "encrypt", "size": size, "rounds": rounds, **encrypt_stats},
+                artifacts={"kind": "performance_throughput", "operation": "encrypt", "size": size, "rounds": rounds, "repetitions": _PERFORMANCE_REPETITIONS, **encrypt_stats},
             ),
             TestResult(
                 category=TestCategory.PERFORMANCE,
@@ -240,10 +282,11 @@ def run_performance_suite(
                 summary="统计连续解密的数据处理吞吐量。",
                 metrics=(
                     TestMetric("吞吐量", f"{decrypt_stats['throughput_mib_s']:.4f} MiB/s"),
-                    TestMetric("平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("中位平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
                     TestMetric("总数据量", f"{size * rounds} 字节"),
+                    TestMetric("重复轮数", str(_PERFORMANCE_REPETITIONS)),
                 ),
-                artifacts={"kind": "performance_throughput", "operation": "decrypt", "size": size, "rounds": rounds, **decrypt_stats},
+                artifacts={"kind": "performance_throughput", "operation": "decrypt", "size": size, "rounds": rounds, "repetitions": _PERFORMANCE_REPETITIONS, **decrypt_stats},
             ),
             TestResult(
                 category=TestCategory.PERFORMANCE,
@@ -253,9 +296,10 @@ def run_performance_suite(
                 metrics=(
                     TestMetric("cpb", f"{encrypt_stats['cpb']:.4f}" if encrypt_stats['cpb'] is not None else "不可用"),
                     TestMetric("CPU 频率", f"{encrypt_stats['cpu_freq_ghz']:.3f} GHz" if encrypt_stats['cpu_freq_ghz'] is not None else "不可用"),
-                    TestMetric("平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("中位平均耗时", f"{encrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("重复轮数", str(_PERFORMANCE_REPETITIONS)),
                 ),
-                artifacts={"kind": "performance_cpb", "operation": "encrypt", "size": size, "rounds": rounds, **encrypt_stats},
+                artifacts={"kind": "performance_cpb", "operation": "encrypt", "size": size, "rounds": rounds, "repetitions": _PERFORMANCE_REPETITIONS, **encrypt_stats},
             ),
             TestResult(
                 category=TestCategory.PERFORMANCE,
@@ -265,9 +309,10 @@ def run_performance_suite(
                 metrics=(
                     TestMetric("cpb", f"{decrypt_stats['cpb']:.4f}" if decrypt_stats['cpb'] is not None else "不可用"),
                     TestMetric("CPU 频率", f"{decrypt_stats['cpu_freq_ghz']:.3f} GHz" if decrypt_stats['cpu_freq_ghz'] is not None else "不可用"),
-                    TestMetric("平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("中位平均耗时", f"{decrypt_stats['avg_us']:.2f} 微秒/次"),
+                    TestMetric("重复轮数", str(_PERFORMANCE_REPETITIONS)),
                 ),
-                artifacts={"kind": "performance_cpb", "operation": "decrypt", "size": size, "rounds": rounds, **decrypt_stats},
+                artifacts={"kind": "performance_cpb", "operation": "decrypt", "size": size, "rounds": rounds, "repetitions": _PERFORMANCE_REPETITIONS, **decrypt_stats},
             ),
         ]
         results.extend(chunk)
@@ -470,7 +515,7 @@ def run_comparison_report_for_category(algorithms: list[str], category: TestCate
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
     if category == TestCategory.PERFORMANCE:
-        notes = []
+        notes = [f"性能耗时使用 {_PERFORMANCE_REPETITIONS} 轮中位数作为稳定值；总耗时包含内存分析等附加步骤，不等同于纯加解密耗时。"]
     elif category == TestCategory.SECURITY:
         notes = ["随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。"]
     else:
@@ -492,7 +537,7 @@ def run_comparison_report_stream_for_category(
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
     if category == TestCategory.PERFORMANCE:
-        notes = []
+        notes = [f"性能耗时使用 {_PERFORMANCE_REPETITIONS} 轮中位数作为稳定值；总耗时包含内存分析等附加步骤，不等同于纯加解密耗时。"]
     elif category == TestCategory.SECURITY:
         notes = ["随机性与雪崩效应结果用于统计比较，不能替代正式安全证明。"]
     else:
@@ -516,7 +561,10 @@ def run_comparison_report_stream_for_category(
 def run_comparison_report(algorithms: list[str]) -> ComparisonReport:
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
-    notes = ["统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明。"]
+    notes = [
+        f"性能耗时使用 {_PERFORMANCE_REPETITIONS} 轮中位数作为稳定值；总耗时包含内存分析和安全性测试等附加步骤，不等同于纯加解密耗时。",
+        "统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明。",
+    ]
     for algorithm in algorithms:
         report = run_algorithm_report(algorithm)
         reports.append(report)
@@ -552,7 +600,10 @@ def run_comparison_report_stream(
 ) -> ComparisonReport:
     rows: list[ComparisonRow] = []
     reports: list[AlgorithmReport] = []
-    notes = ["统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明。"]
+    notes = [
+        f"性能耗时使用 {_PERFORMANCE_REPETITIONS} 轮中位数作为稳定值；总耗时包含内存分析和安全性测试等附加步骤，不等同于纯加解密耗时。",
+        "统计随机性与雪崩效应只能作为补充指标，不能替代正式安全证明。",
+    ]
     total = len(algorithms)
     for index, algorithm in enumerate(algorithms, start=1):
         if progress_callback is not None:

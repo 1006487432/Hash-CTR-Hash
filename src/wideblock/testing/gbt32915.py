@@ -26,6 +26,9 @@ _LONGEST_RUN_M = 10_000
 _MATRIX_ROWS = 32
 _MATRIX_COLS = 32
 
+_DEFAULT_SAMPLE_COUNT = 5
+_PASS_RATE_THRESHOLD = 0.6
+
 _LONGEST_RUN_TABLE = {
     8: {
         "thresholds": ((-math.inf, 1), (2, 2), (3, 3), (4, math.inf)),
@@ -677,59 +680,17 @@ def _discrete_fourier_test(bits: np.ndarray) -> TestResult:
     )
 
 
-def _summary_result(algorithm: str, results: list[TestResult]) -> TestResult:
-    ciphertext = _ciphertext_sample(algorithm)
-    bits = _bit_sequence(algorithm)
-    counts, chi_history = _byte_histogram(algorithm)
-    ones_ratio = _count_ones(bits) / len(bits)
-    zeros_ratio = 1.0 - ones_ratio
-    expected = len(ciphertext) / 256.0
-    chi_square = float(sum(((count - expected) ** 2) / expected for count in counts)) if expected else 0.0
-    passed = sum(result.status == TestStatus.PASSED for result in results)
-    failed = sum(result.status == TestStatus.FAILED for result in results)
-    status = TestStatus.PASSED if failed == 0 else TestStatus.WARNING if passed >= len(results) * 0.8 else TestStatus.FAILED
-    return TestResult(
-        category=TestCategory.SECURITY,
-        name="GB/T 32915 随机性测试总览",
-        status=status,
-        summary=(
-            "标准随机性检测整体表现良好。"
-            if status == TestStatus.PASSED
-            else "标准随机性检测存在少量未通过项。"
-            if status == TestStatus.WARNING
-            else "标准随机性检测未通过项较多。"
-        ),
-        details=(
-            "本结果按照 GB/T 32915-2016 第 4 章实现，基于 1,000,000 比特密文样本执行各项随机性检测。"
-            "第 5 章面向随机数发生器的 1000 组样本合格率判定暂未纳入当前 GUI 运行流程。"
-        ),
-        metrics=(
-            TestMetric("样本长度", f"{len(bits)} 比特"),
-            TestMetric("通过项", str(passed)),
-            TestMetric("失败项", str(failed)),
-            TestMetric("1 比例", f"{ones_ratio * 100:.2f}%"),
-            TestMetric("字节卡方", f"{chi_square:.2f}"),
-        ),
-        artifacts={
-            "kind": "randomness",
-            "ones_ratio": ones_ratio,
-            "zeros_ratio": zeros_ratio,
-            "chi_square": chi_square,
-            "chi_history": chi_history,
-            "byte_counts": counts,
-            "sample_count": 1,
-            "total_bytes": len(ciphertext),
-            "passed": passed,
-            "failed": failed,
-            "gbt_tests": tuple((result.name, result.status.value) for result in results),
-        },
-    )
+def _generate_sample_bits(algorithm: str, trial: int) -> np.ndarray:
+    encrypt = get_algorithm(algorithm)["encrypt"]
+    key = _sample_bytes(f"{algorithm}:gbt32915:key:{trial}", _key_size_for_algorithm(algorithm))
+    plaintext = _sample_bytes(f"{algorithm}:gbt32915:pt:{trial}", _SEQUENCE_BYTES)
+    tweak = _associated_data(algorithm, f"gbt32915:{trial}")
+    ciphertext = encrypt(key, plaintext, tweak)
+    return np.unpackbits(np.frombuffer(ciphertext, dtype=np.uint8))
 
 
-@lru_cache(maxsize=None)
-def run_gbt32915_suite(algorithm: str) -> tuple[TestResult, ...]:
-    bits = _bit_sequence(algorithm)
-    results = [
+def _run_single_suite(bits: np.ndarray) -> list[TestResult]:
+    return [
         _frequency_test(bits),
         _block_frequency_test(bits, _BLOCK_FREQUENCY_M),
         *(_poker_test(bits, m) for m in _POKER_M),
@@ -746,4 +707,98 @@ def run_gbt32915_suite(algorithm: str) -> tuple[TestResult, ...]:
         _maurer_universal_test(bits),
         _discrete_fourier_test(bits),
     ]
-    return (_summary_result(algorithm, results), *results)
+
+
+def _run_gbt32915_multi(algorithm: str, sample_count: int) -> tuple[TestResult, ...]:
+    all_trial_results: list[list[TestResult]] = []
+    for trial in range(sample_count):
+        if trial == 0:
+            bits = _bit_sequence(algorithm)
+        else:
+            bits = _generate_sample_bits(algorithm, trial)
+        all_trial_results.append(_run_single_suite(bits))
+
+    num_tests = len(all_trial_results[0])
+    final_results: list[TestResult] = []
+    for test_idx in range(num_tests):
+        pass_count = sum(
+            1 for trial_results in all_trial_results
+            if trial_results[test_idx].status == TestStatus.PASSED
+        )
+        pass_rate = pass_count / sample_count
+        representative = all_trial_results[0][test_idx]
+
+        if pass_rate >= _PASS_RATE_THRESHOLD:
+            status = TestStatus.PASSED
+        else:
+            status = TestStatus.FAILED
+
+        extra_metrics = representative.metrics + (
+            TestMetric("通过率", f"{pass_count}/{sample_count}"),
+        )
+        artifacts = dict(representative.artifacts)
+        artifacts["pass_rate"] = pass_rate
+        artifacts["pass_count"] = pass_count
+        artifacts["sample_count"] = sample_count
+
+        final_results.append(TestResult(
+            category=representative.category,
+            name=representative.name,
+            status=status,
+            summary=representative.summary if status == TestStatus.PASSED else representative.summary.replace("满足", "偏离").replace("良好", "偏弱") if status == TestStatus.FAILED else representative.summary,
+            details=representative.details,
+            metrics=extra_metrics,
+            artifacts=artifacts,
+        ))
+
+    ciphertext = _ciphertext_sample(algorithm)
+    bits_first = _bit_sequence(algorithm)
+    counts, chi_history = _byte_histogram(algorithm)
+    ones_ratio = _count_ones(bits_first) / len(bits_first)
+    zeros_ratio = 1.0 - ones_ratio
+    expected = len(ciphertext) / 256.0
+    chi_square = float(sum(((count - expected) ** 2) / expected for count in counts)) if expected else 0.0
+    passed = sum(1 for r in final_results if r.status == TestStatus.PASSED)
+    failed = sum(1 for r in final_results if r.status == TestStatus.FAILED)
+    status = TestStatus.PASSED if failed == 0 else TestStatus.WARNING if passed >= len(final_results) * 0.8 else TestStatus.FAILED
+
+    summary_result = TestResult(
+        category=TestCategory.SECURITY,
+        name="GB/T 32915 随机性测试总览",
+        status=status,
+        summary=(
+            "标准随机性检测整体表现良好。"
+            if status == TestStatus.PASSED
+            else "标准随机性检测存在少量未通过项。"
+            if status == TestStatus.WARNING
+            else "标准随机性检测未通过项较多。"
+        ),
+        details=f"基于 {sample_count} 组独立密钥样本（各 1,000,000 比特）执行 GB/T 32915 第 4 章检测，按通过率≥{_PASS_RATE_THRESHOLD*100:.0f}%判定。",
+        metrics=(
+            TestMetric("样本组数", str(sample_count)),
+            TestMetric("样本长度", f"{len(bits_first)} 比特"),
+            TestMetric("通过项", str(passed)),
+            TestMetric("失败项", str(failed)),
+            TestMetric("1 比例", f"{ones_ratio * 100:.2f}%"),
+            TestMetric("字节卡方", f"{chi_square:.2f}"),
+        ),
+        artifacts={
+            "kind": "randomness",
+            "ones_ratio": ones_ratio,
+            "zeros_ratio": zeros_ratio,
+            "chi_square": chi_square,
+            "chi_history": chi_history,
+            "byte_counts": counts,
+            "sample_count": sample_count,
+            "total_bytes": len(ciphertext),
+            "passed": passed,
+            "failed": failed,
+            "gbt_tests": tuple((r.name, r.status.value) for r in final_results),
+        },
+    )
+    return (summary_result, *final_results)
+
+
+@lru_cache(maxsize=None)
+def run_gbt32915_suite(algorithm: str) -> tuple[TestResult, ...]:
+    return _run_gbt32915_multi(algorithm, sample_count=_DEFAULT_SAMPLE_COUNT)

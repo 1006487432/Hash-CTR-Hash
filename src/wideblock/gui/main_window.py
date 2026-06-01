@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -16,8 +21,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..testing import TestCategory, algorithm_label, available_algorithms
+from ..testing import TestCategory, algorithm_label, available_algorithms, run_algorithm_report_stream, run_comparison_report_stream
+from ..testing.report import generate_report
 from .pages import AlgorithmResultPage, ComparisonResultPage
+from .workers import start_streaming_task
 
 
 _GROUPS = {
@@ -94,6 +101,10 @@ class MainWindow(QMainWindow):
         self.single_button.setProperty("class", "primary")
         self.single_button.clicked.connect(self._open_single_tab)
         side_layout.addWidget(self.single_button)
+
+        self.report_button = QPushButton("生成测试报告")
+        self.report_button.clicked.connect(self._generate_batch_reports)
+        side_layout.addWidget(self.report_button)
 
         self.compare_perf_button = QPushButton("打开性能交叉对比")
         self.compare_perf_button.clicked.connect(lambda: self._open_comparison_tab(TestCategory.PERFORMANCE))
@@ -296,6 +307,161 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(page, f"{prefix} | {summary}")
         self.tabs.setCurrentWidget(page)
         self._set_status(f"已打开 {len(selected)} 个算法的{prefix}结果页。", warn=False)
+
+    def _generate_batch_reports(self) -> None:
+        selected = self._checked_algorithm_names()
+        if not selected:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("无法生成报告")
+            msg.setText("请先勾选至少一个算法。")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+            return
+
+        if len(selected) == 1:
+            self._generate_single_report(selected[0])
+        else:
+            self._generate_comparison_report(selected)
+
+    def _generate_single_report(self, algorithm: str) -> None:
+        default_path = Path.cwd() / "reports" / f"{algorithm}_report.md"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存测试报告",
+            str(default_path),
+            "Markdown 文件 (*.md);;所有文件 (*.*)"
+        )
+        if not file_path:
+            return
+
+        self._report_output_path = Path(file_path)
+        self._set_status(f"正在测试 {algorithm_label(algorithm)}...", warn=False)
+        self.report_button.setEnabled(False)
+        self._progress_dialog = QProgressDialog(
+            f"正在测试 {algorithm_label(algorithm)}...", None, 0, 100, self
+        )
+        self._progress_dialog.setWindowTitle("生成报告中")
+        self._progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.setValue(0)
+        self._progress_dialog.setStyleSheet(
+            "QProgressDialog { background-color: white; }"
+            " QLabel { color: black; }"
+            " QProgressBar { border: 1px solid #ccc; border-radius: 4px; text-align: center; }"
+            " QProgressBar::chunk { background-color: #0f5160; border-radius: 3px; }"
+        )
+        start_streaming_task(
+            run_algorithm_report_stream,
+            self._on_single_report_done,
+            self._on_report_error,
+            self._on_report_progress,
+            lambda _partial: None,
+            algorithm,
+        )
+
+    def _generate_comparison_report(self, algorithms: list[str]) -> None:
+        default_path = Path.cwd() / "reports" / f"comparison_{len(algorithms)}_algorithms_report.md"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存对比报告",
+            str(default_path),
+            "Markdown 文件 (*.md);;所有文件 (*.*)"
+        )
+        if not file_path:
+            return
+
+        self._report_output_path = Path(file_path)
+        self._set_status(f"正在测试 {len(algorithms)} 个算法...", warn=False)
+        self.report_button.setEnabled(False)
+        self._progress_dialog = QProgressDialog(
+            f"正在测试 {len(algorithms)} 个算法 (0/{len(algorithms)})...", None, 0, 100, self
+        )
+        self._progress_dialog.setWindowTitle("生成报告中")
+        self._progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.setValue(0)
+        self._progress_dialog.setStyleSheet(
+            "QProgressDialog { background-color: white; }"
+            " QLabel { color: black; }"
+            " QProgressBar { border: 1px solid #ccc; border-radius: 4px; text-align: center; }"
+            " QProgressBar::chunk { background-color: #0f5160; border-radius: 3px; }"
+        )
+        start_streaming_task(
+            run_comparison_report_stream,
+            self._on_comparison_report_done,
+            self._on_report_error,
+            self._on_report_progress,
+            lambda _partial: None,
+            algorithms,
+        )
+
+    def _on_report_progress(self, current: int | float, total: int, text: str) -> None:
+        dialog = getattr(self, '_progress_dialog', None)
+        if dialog is None:
+            return
+        value = 0 if total <= 0 else int(max(0.0, min(1.0, float(current) / float(total))) * 100)
+        dialog.setValue(value)
+        dialog.setLabelText(text)
+
+    def _on_single_report_done(self, report) -> None:
+        self.report_button.setEnabled(True)
+        if hasattr(self, '_progress_dialog') and self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        try:
+            generate_report(report, self._report_output_path)
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setWindowTitle("报告生成成功")
+            msg.setText(f"测试报告已保存至:\n{self._report_output_path}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+            self._set_status("报告生成完成", warn=False)
+        except Exception as e:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("报告生成失败")
+            msg.setText(f"生成报告时发生错误:\n{str(e)}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+            self._set_status("报告生成失败", warn=True)
+
+    def _on_comparison_report_done(self, report) -> None:
+        self.report_button.setEnabled(True)
+        if hasattr(self, '_progress_dialog') and self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        try:
+            generate_report(report, self._report_output_path)
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setWindowTitle("报告生成成功")
+            msg.setText(f"对比报告已保存至:\n{self._report_output_path}\n\n包含 {len(report.rows)} 个算法的完整测试结果")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+            self._set_status("报告生成完成", warn=False)
+        except Exception as e:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("报告生成失败")
+            msg.setText(f"生成报告时发生错误:\n{str(e)}")
+            msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+            msg.exec()
+            self._set_status("报告生成失败", warn=True)
+
+    def _on_report_error(self, message: str) -> None:
+        self.report_button.setEnabled(True)
+        if hasattr(self, '_progress_dialog') and self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setWindowTitle("报告生成失败")
+        msg.setText(f"生成报告时发生错误:\n{message}")
+        msg.setStyleSheet("QMessageBox { background-color: white; } QLabel { color: black; } QPushButton { color: black; }")
+        msg.exec()
+        self._set_status("报告生成失败", warn=True)
 
     def _close_tab(self, index: int) -> None:
         widget = self.tabs.widget(index)
